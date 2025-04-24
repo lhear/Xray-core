@@ -23,6 +23,7 @@ import (
 	"github.com/xtls/xray-core/common/uuid"
 	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/browser_dialer"
+	"github.com/xtls/xray-core/transport/internet/qls"
 	"github.com/xtls/xray-core/transport/internet/reality"
 	"github.com/xtls/xray-core/transport/internet/stat"
 	"github.com/xtls/xray-core/transport/internet/tls"
@@ -75,30 +76,44 @@ func getHTTPClient(ctx context.Context, dest net.Destination, streamSettings *in
 	return xmuxClient.XmuxConn.(DialerClient), xmuxClient
 }
 
-func decideHTTPVersion(tlsConfig *tls.Config, realityConfig *reality.Config) string {
+func decideHTTPVersion(tlsConfig *tls.Config, realityConfig *reality.Config, qlsConfig *qls.Config) string {
+	// 优先级 H3 > Reality > QLS > TLS > Default
+
+	// 1. 检查 TLS 是否指定 H3
+	if tlsConfig != nil && len(tlsConfig.NextProtocol) == 1 && tlsConfig.NextProtocol[0] == "h3" {
+		return "3"
+	}
+
+	// 2. 如果配置了 Reality，使用 H2
 	if realityConfig != nil {
 		return "2"
 	}
+
+	// 3. 如果配置了 QLS，使用 H2
+	if qlsConfig != nil {
+		return "2"
+	}
+
+	// 4. 如果没有 TLS，使用 H1.1
 	if tlsConfig == nil {
 		return "1.1"
 	}
-	if len(tlsConfig.NextProtocol) != 1 {
-		return "2"
-	}
-	if tlsConfig.NextProtocol[0] == "http/1.1" {
+
+	// 5. 检查 TLS 是否明确指定 H1.1
+	if len(tlsConfig.NextProtocol) == 1 && tlsConfig.NextProtocol[0] == "http/1.1" {
 		return "1.1"
 	}
-	if tlsConfig.NextProtocol[0] == "h3" {
-		return "3"
-	}
+
+	// 6. 其他 TLS 情况 (默认 H2)
 	return "2"
 }
 
 func createHTTPClient(dest net.Destination, streamSettings *internet.MemoryStreamConfig) DialerClient {
 	tlsConfig := tls.ConfigFromStreamSettings(streamSettings)
 	realityConfig := reality.ConfigFromStreamSettings(streamSettings)
+	qlsConfig := qls.ConfigFromStreamSettings(streamSettings)
 
-	httpVersion := decideHTTPVersion(tlsConfig, realityConfig)
+	httpVersion := decideHTTPVersion(tlsConfig, realityConfig, qlsConfig)
 	if httpVersion == "3" {
 		dest.Network = net.Network_UDP // better to keep this line
 	}
@@ -118,7 +133,10 @@ func createHTTPClient(dest net.Destination, streamSettings *internet.MemoryStrea
 		}
 
 		if realityConfig != nil {
-			return reality.UClient(conn, realityConfig, ctxInner, dest)
+			conn, err = reality.UClient(conn, realityConfig, ctxInner, dest)
+			if err != nil {
+				return nil, err
+			}
 		}
 
 		if gotlsConfig != nil {
@@ -129,6 +147,13 @@ func createHTTPClient(dest net.Destination, streamSettings *internet.MemoryStrea
 				}
 			} else {
 				conn = tls.Client(conn, gotlsConfig)
+			}
+		}
+
+		if qlsConfig != nil {
+			conn, err = qls.Client(ctxInner, conn, qlsConfig)
+			if err != nil {
+				return nil, err
 			}
 		}
 
@@ -247,8 +272,10 @@ func init() {
 func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.MemoryStreamConfig) (stat.Connection, error) {
 	tlsConfig := tls.ConfigFromStreamSettings(streamSettings)
 	realityConfig := reality.ConfigFromStreamSettings(streamSettings)
+	qlsConfig := qls.ConfigFromStreamSettings(streamSettings)
 
-	httpVersion := decideHTTPVersion(tlsConfig, realityConfig)
+	httpVersion := decideHTTPVersion(tlsConfig, realityConfig, qlsConfig)
+
 	if httpVersion == "3" {
 		dest.Network = net.Network_UDP
 	}
@@ -256,7 +283,8 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 	transportConfiguration := streamSettings.ProtocolSettings.(*Config)
 	var requestURL url.URL
 
-	if tlsConfig != nil || realityConfig != nil {
+	// 如果配置了 TLS、Reality 或 QLS，则使用 https scheme
+	if tlsConfig != nil || realityConfig != nil || qlsConfig != nil {
 		requestURL.Scheme = "https"
 	} else {
 		requestURL.Scheme = "http"
@@ -307,11 +335,13 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 		dest2 := *memory2.Destination // just panic
 		tlsConfig2 := tls.ConfigFromStreamSettings(memory2)
 		realityConfig2 := reality.ConfigFromStreamSettings(memory2)
-		httpVersion2 := decideHTTPVersion(tlsConfig2, realityConfig2)
+		qlsConfig2 := qls.ConfigFromStreamSettings(memory2)
+		httpVersion2 := decideHTTPVersion(tlsConfig2, realityConfig2, qlsConfig2)
 		if httpVersion2 == "3" {
 			dest2.Network = net.Network_UDP
 		}
-		if tlsConfig2 != nil || realityConfig2 != nil {
+		// 对 requestURL2 也应用相同的 scheme 判断逻辑
+		if tlsConfig2 != nil || realityConfig2 != nil || qlsConfig2 != nil {
 			requestURL2.Scheme = "https"
 		} else {
 			requestURL2.Scheme = "http"
