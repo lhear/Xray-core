@@ -11,6 +11,7 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/cloudflare/circl/sign/mldsa/mldsa65"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/platform/filesystem"
@@ -18,6 +19,7 @@ import (
 	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/httpupgrade"
 	"github.com/xtls/xray-core/transport/internet/kcp"
+	"github.com/xtls/xray-core/transport/internet/qls"
 	"github.com/xtls/xray-core/transport/internet/reality"
 	"github.com/xtls/xray-core/transport/internet/splithttp"
 	"github.com/xtls/xray-core/transport/internet/tcp"
@@ -942,6 +944,7 @@ type StreamConfig struct {
 	WSSettings          *WebSocketConfig   `json:"wsSettings"`
 	HTTPUPGRADESettings *HttpUpgradeConfig `json:"httpupgradeSettings"`
 	SocketSettings      *SocketConfig      `json:"sockopt"`
+	QLSSettings         *QLSConfig         `json:"qlsSettings"`
 }
 
 // Build implements Buildable.
@@ -990,6 +993,17 @@ func (c *StreamConfig) Build() (*internet.StreamConfig, error) {
 		config.SecurityType = tm.Type
 	case "xtls":
 		return nil, errors.PrintRemovedFeatureError(`Legacy XTLS`, `xtls-rprx-vision with TLS or REALITY`)
+	case "qls":
+		if c.QLSSettings == nil {
+			return nil, errors.New(`QLS: Empty "qlsSettings".`)
+		}
+		ts, err := c.QLSSettings.Build()
+		if err != nil {
+			return nil, errors.New("Failed to build QLS config.").Base(err)
+		}
+		tm := serial.ToTypedMessage(ts)
+		config.SecuritySettings = append(config.SecuritySettings, tm)
+		config.SecurityType = tm.Type
 	default:
 		return nil, errors.New(`Unknown security "` + c.Security + `".`)
 	}
@@ -1085,4 +1099,70 @@ func (v *ProxyConfig) Build() (*internet.ProxyConfig, error) {
 		Tag:                 v.Tag,
 		TransportLayerProxy: v.TransportLayerProxy,
 	}, nil
+}
+
+// QLSConfig is the configuration for QLS security in JSON.
+type QLSConfig struct {
+	PublicKey        string `json:"publicKey"`
+	PrivateKey       string `json:"privateKey"`
+	HandshakeTimeout uint32 `json:"handshakeTimeout"`
+}
+
+// Build implements Buildable.
+func (c *QLSConfig) Build() (proto.Message, error) {
+	config := new(qls.Config)
+
+	hasPublicKey := len(c.PublicKey) > 0
+	hasPrivateKey := len(c.PrivateKey) > 0
+
+	// Validate key combinations
+	if hasPublicKey && hasPrivateKey {
+		return nil, errors.New("cannot provide both public and private keys in the same config")
+	}
+	if !hasPublicKey && !hasPrivateKey {
+		return nil, errors.New("either publicKey (client) or privateKey (server) must be provided")
+	}
+
+	// Handle ML-DSA keys
+	if c.PublicKey != "" {
+		pubKeyBytes, err := base64.RawURLEncoding.DecodeString(c.PublicKey)
+		if err != nil {
+			return nil, errors.New("invalid publicKey encoding").Base(err)
+		}
+		// ML-DSA-65 public key size is 1952 bytes
+		if len(pubKeyBytes) != 1952 {
+			return nil, errors.New("invalid publicKey length").AtError()
+		}
+		config.PublicKey = pubKeyBytes
+	}
+
+	if c.PrivateKey != "" {
+		privKeyBytes, err := base64.RawURLEncoding.DecodeString(c.PrivateKey)
+		if err != nil {
+			return nil, errors.New("invalid privateKey encoding").Base(err)
+		}
+
+		// Check if it's a 32-byte seed
+		if len(privKeyBytes) != 32 {
+			// Only support 32-byte seed format
+			return nil, errors.New("invalid privateKey length, expected 32-byte seed").AtError()
+		}
+		// It's a seed from cmdMldsa65, generate the full private key
+		seed := [32]byte{}
+		copy(seed[:], privKeyBytes)
+		_, privKey := mldsa65.NewKeyFromSeed(&seed)
+		privKeyBytes, err = privKey.MarshalBinary()
+		if err != nil {
+			return nil, errors.New("failed to marshal ML-DSA private key").Base(err)
+		}
+		config.PrivateKey = privKeyBytes
+	}
+
+	config.HandshakeTimeout = c.HandshakeTimeout
+	// Default handshake timeout if not set
+	if config.HandshakeTimeout == 0 {
+		config.HandshakeTimeout = 10 * 1000 // Default to 10 seconds
+	}
+
+	return config, nil
 }
