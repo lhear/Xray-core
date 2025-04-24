@@ -1,0 +1,21 @@
+syntax = "proto3";
+
+package xray.transport.internet.qls;
+option csharp_namespace = "Xray.Transport.Internet.Qls";
+option go_package = "github.com/xtls/xray-core/transport/internet/qls";
+option java_package = "com.xray.transport.internet.qls";
+option java_multiple_files = true;
+
+// QLSConfig is the configuration for QLS security.
+message Config {
+  // ML-DSA public key for client.
+  // In Base64URL format.
+  bytes public_key = 1;
+
+  // ML-DSA private key for server (seed).
+  // In Base64URL format.
+  bytes private_key = 2;
+
+  // Handshake timeout in millisecond. Default is 10 seconds.
+  uint32 handshake_timeout = 3;
+}
