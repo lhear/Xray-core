@@ -21,6 +21,7 @@ import (
 	http_proto "github.com/xtls/xray-core/common/protocol/http"
 	"github.com/xtls/xray-core/common/signal/done"
 	"github.com/xtls/xray-core/transport/internet"
+	"github.com/xtls/xray-core/transport/internet/qls"
 	"github.com/xtls/xray-core/transport/internet/reality"
 	"github.com/xtls/xray-core/transport/internet/stat"
 	"github.com/xtls/xray-core/transport/internet/tls"
@@ -364,6 +365,9 @@ func ListenXH(ctx context.Context, address net.Address, port net.Port, streamSet
 		sessions:  sync.Map{},
 	}
 	tlsConfig := getTLSConfig(streamSettings)
+	realityConfig := reality.ConfigFromStreamSettings(streamSettings)
+	qlsConfig := qls.ConfigFromStreamSettings(streamSettings)
+
 	l.isH3 = len(tlsConfig.NextProtos) == 1 && tlsConfig.NextProtos[0] == "h3"
 
 	var err error
@@ -413,13 +417,16 @@ func ListenXH(ctx context.Context, address net.Address, port net.Port, streamSet
 
 	// tcp/unix (h1/h2)
 	if l.listener != nil {
+		if realityConfig != nil {
+			l.listener = goreality.NewListener(l.listener, realityConfig.GetREALITYConfig())
+		}
 		if config := tls.ConfigFromStreamSettings(streamSettings); config != nil {
 			if tlsConfig := config.GetTLSConfig(); tlsConfig != nil {
 				l.listener = gotls.NewListener(l.listener, tlsConfig)
 			}
 		}
-		if config := reality.ConfigFromStreamSettings(streamSettings); config != nil {
-			l.listener = goreality.NewListener(l.listener, config.GetREALITYConfig())
+		if qlsConfig != nil {
+			l.listener = qls.NewListener(l.listener, qlsConfig)
 		}
 
 		handler.localAddr = l.listener.Addr()
